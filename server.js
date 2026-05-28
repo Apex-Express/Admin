@@ -45,19 +45,33 @@ db.serialize(() => {
     [process.env.ADMIN_USERNAME, hashed]);
 });
 
+// Middleware to verify JWT
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) return res.status(401).json({ message: 'No token provided' });
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ message: 'Invalid token' });
+    req.user = user;
+    next();
+  });
+};
+
 // POST /api/apply - handle membership form submission
 app.post("/api/apply", (req, res) => {
   try {
     const { fullName, email, gender, phone, nationality, favoriteCelebrity, reason } = req.body;
 
-    if (!fullName || !email) {
+    if (!fullName ||!email) {
       return res.status(400).json({ message: "Name and email are required" });
     }
 
-    const sql = `INSERT INTO applications 
-      (name, email, phone, gender, nationality, selectedCelebrity, message) 
-      VALUES (?, ?, ?)`;
-    
+    const sql = `INSERT INTO applications
+      (name, email, phone, gender, nationality, selectedCelebrity, message)
+      VALUES (?,?,?)`;
+
     db.run(sql, [fullName, email, phone, gender, nationality, favoriteCelebrity, reason], function(err) {
       if (err) {
         console.error("DB insert error:", err);
@@ -71,6 +85,33 @@ app.post("/api/apply", (req, res) => {
     console.error("Server error:", err);
     res.status(500).json({ message: "Server error" });
   }
+});
+
+// POST /api/login - admin login
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+
+  db.get('SELECT * FROM admins WHERE username =?', [username], (err, admin) => {
+    if (err ||!admin) return res.status(401).json({ message: 'Invalid credentials' });
+
+    if (bcrypt.compareSync(password, admin.password)) {
+      const token = jwt.sign({ id: admin.id, username: admin.username }, process.env.JWT_SECRET, { expiresIn: '24h' });
+      res.json({ token });
+    } else {
+      res.status(401).json({ message: 'Invalid credentials' });
+    }
+  });
+});
+
+// GET /api/applications - view all submissions, protected
+app.get('/api/applications', authenticateToken, (req, res) => {
+  db.all('SELECT * FROM applications ORDER BY submitted_at DESC', [], (err, rows) => {
+    if (err) {
+      console.error("DB fetch error:", err);
+      return res.status(500).json({ message: 'Database error' });
+    }
+    res.json(rows);
+  });
 });
 
 const PORT = process.env.PORT || 3000;
