@@ -1340,27 +1340,247 @@ function renderReports() {
 }
 
 // ═══════════════════════════════════════════════════
-// INVOICE JPG (rendered on a canvas, downloaded as .jpg)
+// INVOICE PDF — vector text/graphics + embedded fonts.
+// Only stamps, the logo badge, and the QR code are raster
+// (rendered at 300 DPI, PNG, no re-compression).
 // ═══════════════════════════════════════════════════
-function rrPath(ctx, x, y, w, h, r) {
+
+function arrayBufferToBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+let _fontCache = null;
+async function loadInvoiceFonts(doc) {
+  if (_fontCache) return _fontCache;
+  const want = [
+    { url: 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/inter/static/Inter-Regular.ttf', file: 'Inter-Regular.ttf', name: 'InterEmbed', style: 'normal' },
+    { url: 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/inter/static/Inter-Bold.ttf', file: 'Inter-Bold.ttf', name: 'InterEmbed', style: 'bold' },
+    { url: 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/inter/static/Inter-Italic.ttf', file: 'Inter-Italic.ttf', name: 'InterEmbed', style: 'italic' },
+    { url: 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/inter/static/Inter-BoldItalic.ttf', file: 'Inter-BoldItalic.ttf', name: 'InterEmbed', style: 'bolditalic' },
+    { url: 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/caveat/static/Caveat-Bold.ttf', file: 'Caveat-Bold.ttf', name: 'CaveatEmbed', style: 'bold' },
+  ];
+  const have = { normal: false, bold: false, italic: false, bolditalic: false, sig: false };
+  await Promise.all(want.map(async f => {
+    try {
+      const res = await fetch(f.url);
+      if (!res.ok) throw new Error('font fetch failed');
+      const buf = await res.arrayBuffer();
+      const b64 = arrayBufferToBase64(buf);
+      doc.addFileToVFS(f.file, b64);
+      doc.addFont(f.file, f.name, f.style);
+      if (f.name === 'CaveatEmbed') have.sig = true;
+      else have[f.style] = true;
+    } catch (e) { /* fall back silently below */ }
+  }));
+  _fontCache = have;
+  return have;
+}
+
+function setInvoiceFont(doc, fonts, weight, sizePt) {
+  // weight: 'normal' | 'bold' | 'italic' | 'bolditalic'
+  if (weight === 'bolditalic' && fonts.bolditalic) doc.setFont('InterEmbed', 'bolditalic');
+  else if (weight === 'bold' && fonts.bold) doc.setFont('InterEmbed', 'bold');
+  else if (weight === 'italic' && fonts.italic) doc.setFont('InterEmbed', 'italic');
+  else if (fonts.normal) doc.setFont('InterEmbed', 'normal');
+  else doc.setFont('helvetica', weight === 'italic' || weight === 'bolditalic' ? 'italic' : (weight === 'bold' ? 'bold' : 'normal'));
+  doc.setFontSize(sizePt);
+}
+
+// Finds the largest font size (down to a floor) that keeps `text` within maxWidthMM.
+function fitFontSize(doc, fonts, text, weight, maxWidthMM, maxSize, minSize) {
+  let size = maxSize;
+  minSize = minSize || 20;
+  setInvoiceFont(doc, fonts, weight, size);
+  while (size > minSize && doc.getTextWidth(text) > maxWidthMM) {
+    size -= 2;
+    setInvoiceFont(doc, fonts, weight, size);
+  }
+  return size;
+}
+
+function setSigFont(doc, fonts, sizePt) {
+  if (fonts.sig) doc.setFont('CaveatEmbed', 'bold');
+  else doc.setFont('times', 'italic');
+  doc.setFontSize(sizePt);
+}
+
+// ── 300 DPI raster helpers (stamps + logo badge) ──────
+function drawStarCanvas(ctx, cx, cy, r, color) {
+  ctx.save();
+  ctx.translate(cx, cy);
   ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
+  for (let i = 0; i < 10; i++) {
+    const ang = (Math.PI / 5) * i - Math.PI / 2;
+    const rad = i % 2 === 0 ? r : r * 0.42;
+    const x = Math.cos(ang) * rad, y2 = Math.sin(ang) * rad;
+    if (i === 0) ctx.moveTo(x, y2); else ctx.lineTo(x, y2);
+  }
   ctx.closePath();
-}
-function fillRR(ctx, x, y, w, h, r, color) {
-  if (color) ctx.fillStyle = color;
-  rrPath(ctx, x, y, w, h, r);
+  ctx.fillStyle = color;
   ctx.fill();
+  ctx.restore();
 }
-function strokeRR(ctx, x, y, w, h, r, color, lineWidth) {
-  ctx.strokeStyle = color;
-  ctx.lineWidth = lineWidth;
-  rrPath(ctx, x, y, w, h, r);
-  ctx.stroke();
+
+function renderStampPNG(sizeMM, mainText, subText, serial, color, angleDeg) {
+  const DPI = 300, PXMM = DPI / 25.4;
+  const pad = 1.08;
+  const canvasPx = Math.round(sizeMM * 2 * pad * PXMM);
+  const c = document.createElement('canvas');
+  c.width = canvasPx; c.height = canvasPx;
+  const ctx = c.getContext('2d');
+  const r = (sizeMM * PXMM);
+  const cx = canvasPx / 2, cy = canvasPx / 2;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate((angleDeg || 0) * Math.PI / 180);
+  ctx.globalAlpha = 0.82;
+  ctx.strokeStyle = color; ctx.fillStyle = color;
+  ctx.lineWidth = r * 0.05;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke();
+  ctx.lineWidth = r * 0.026;
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.83, 0, Math.PI * 2); ctx.stroke();
+  drawStarCanvas(ctx, 0, -r * 0.46, r * 0.13, color);
+  ctx.textAlign = 'center';
+  ctx.font = `bold ${r * 0.165}px Helvetica, Arial, sans-serif`;
+  const words = mainText.split(' ');
+  if (words.length > 1 && mainText.length > 10) {
+    const mid = Math.ceil(words.length / 2);
+    ctx.fillText(words.slice(0, mid).join(' '), 0, -r * 0.02);
+    ctx.fillText(words.slice(mid).join(' '), 0, r * 0.17);
+  } else {
+    ctx.fillText(mainText, 0, r * 0.06);
+  }
+  ctx.font = `${r * 0.1}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(subText, 0, r * 0.42);
+  ctx.globalAlpha = 0.6;
+  ctx.font = `${r * 0.085}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(serial, 0, r * 0.6);
+  ctx.restore();
+  return { dataUrl: c.toDataURL('image/png'), sizeMM: sizeMM * 2 * pad };
+}
+
+function renderLogoBadgePNG(sizeMM) {
+  const DPI = 300, PXMM = DPI / 25.4;
+  const px = Math.round(sizeMM * PXMM);
+  const c = document.createElement('canvas');
+  c.width = px; c.height = px;
+  const ctx = c.getContext('2d');
+  const r = px * 0.18;
+  ctx.fillStyle = 'rgb(233,165,14)';
+  ctx.beginPath();
+  ctx.moveTo(r, 0); ctx.arcTo(px, 0, px, px, r); ctx.arcTo(px, px, 0, px, r);
+  ctx.arcTo(0, px, 0, 0, r); ctx.arcTo(0, 0, px, 0, r);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `bold ${px * 0.34}px Helvetica, Arial, sans-serif`;
+  ctx.fillText('AEL', px / 2, px * 0.53);
+  return c.toDataURL('image/png');
+}
+
+function renderQrPNG(img, sizeMM) {
+  const DPI = 300, PXMM = DPI / 25.4;
+  const px = Math.round(sizeMM * PXMM);
+  const c = document.createElement('canvas');
+  c.width = px; c.height = px;
+  const ctx = c.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(img, 0, 0, px, px);
+  return c.toDataURL('image/png');
+}
+
+// ── country flags (300 DPI PNG, sourced from flagcdn.com) ──
+const COUNTRY_CODE_MAP = {
+  'nigeria':'ng','united kingdom':'gb','uk':'gb','great britain':'gb','england':'gb','scotland':'gb','wales':'gb',
+  'united states':'us','usa':'us','us':'us','united states of america':'us','america':'us',
+  'canada':'ca','china':'cn','india':'in','pakistan':'pk','bangladesh':'bd','japan':'jp','south korea':'kr','korea':'kr',
+  'germany':'de','france':'fr','italy':'it','spain':'es','portugal':'pt','netherlands':'nl','belgium':'be',
+  'switzerland':'ch','austria':'at','sweden':'se','norway':'no','denmark':'dk','finland':'fi','poland':'pl',
+  'ireland':'ie','greece':'gr','turkey':'tr','russia':'ru','ukraine':'ua','romania':'ro','hungary':'hu','czech republic':'cz',
+  'south africa':'za','kenya':'ke','ghana':'gh','egypt':'eg','morocco':'ma','ethiopia':'et','tanzania':'tz','uganda':'ug',
+  'senegal':'sn','ivory coast':'ci', "cote d'ivoire":'ci','cameroon':'cm','algeria':'dz','tunisia':'tn','zambia':'zm','zimbabwe':'zw',
+  'australia':'au','new zealand':'nz','brazil':'br','mexico':'mx','argentina':'ar','chile':'cl','colombia':'co','peru':'pe',
+  'venezuela':'ve','uae':'ae','united arab emirates':'ae','dubai':'ae','saudi arabia':'sa','qatar':'qa','kuwait':'kw',
+  'bahrain':'bh','oman':'om','israel':'il','jordan':'jo','lebanon':'lb','iraq':'iq','iran':'ir',
+  'indonesia':'id','malaysia':'my','singapore':'sg','thailand':'th','vietnam':'vn','philippines':'ph','myanmar':'mm',
+  'sri lanka':'lk','nepal':'np','hong kong':'hk','taiwan':'tw',
+  'poland':'pl','portugal':'pt','iceland':'is','luxembourg':'lu','croatia':'hr','serbia':'rs','bulgaria':'bg',
+  'slovakia':'sk','slovenia':'si','estonia':'ee','latvia':'lv','lithuania':'lt','cyprus':'cy','malta':'mt',
+};
+function countryCodeFromLocation(str) {
+  if (!str) return null;
+  const parts = String(str).split(',').map(p => p.trim().toLowerCase()).filter(Boolean);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (COUNTRY_CODE_MAP[parts[i]]) return COUNTRY_CODE_MAP[parts[i]];
+  }
+  const whole = String(str).trim().toLowerCase();
+  return COUNTRY_CODE_MAP[whole] || null;
+}
+async function fetchFlagPNG(countryCode, widthMM) {
+  if (!countryCode) return null;
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const im = new Image();
+      im.crossOrigin = 'anonymous';
+      im.onload = () => resolve(im);
+      im.onerror = reject;
+      im.src = 'https://flagcdn.com/w320/' + countryCode + '.png';
+    });
+    const DPI = 300, PXMM = DPI / 25.4;
+    const wpx = Math.round(widthMM * PXMM);
+    const hpx = Math.round(wpx * (img.height / img.width));
+    const c = document.createElement('canvas');
+    c.width = wpx; c.height = hpx;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(img, 0, 0, wpx, hpx);
+    return { dataUrl: c.toDataURL('image/png'), heightMM: widthMM * (img.height / img.width) };
+  } catch (e) { return null; }
+}
+
+// ── vector layout primitives ──────────────────────────
+function vRect(doc, x, y, w, h, rgb, style) {
+  doc.setFillColor(rgb[0], rgb[1], rgb[2]);
+  doc.rect(x, y, w, h, style || 'F');
+}
+function vRR(doc, x, y, w, h, r, rgb, style) {
+  doc.setFillColor(rgb[0], rgb[1], rgb[2]);
+  doc.roundedRect(x, y, w, h, r, r, style || 'F');
+}
+function vStrokeRR(doc, x, y, w, h, r, rgb, lw) {
+  doc.setDrawColor(rgb[0], rgb[1], rgb[2]);
+  doc.setLineWidth(lw);
+  doc.roundedRect(x, y, w, h, r, r, 'S');
+}
+function vLine(doc, x1, y1, x2, y2, rgb, lw) {
+  doc.setDrawColor(rgb[0], rgb[1], rgb[2]);
+  doc.setLineWidth(lw);
+  doc.line(x1, y1, x2, y2);
+}
+function vText(doc, fonts, text, x, y, opts) {
+  opts = opts || {};
+  setInvoiceFont(doc, fonts, opts.weight || 'normal', opts.size || 9);
+  const c = opts.color || [0, 0, 0];
+  doc.setTextColor(c[0], c[1], c[2]);
+  const o = { align: opts.align || 'left' };
+  if (opts.angle) o.angle = opts.angle;
+  doc.text(text, x, y, o);
+}
+function withOpacity(doc, alpha, fn) {
+  let restored = false;
+  try {
+    const g = new doc.GState({ opacity: alpha });
+    doc.setGState(g);
+    fn();
+    doc.setGState(new doc.GState({ opacity: 1 }));
+    restored = true;
+  } catch (e) {}
+  if (!restored) fn(); // GState unsupported — draw at full opacity as fallback
 }
 
 async function generateInvoice(s) {
@@ -1368,7 +1588,10 @@ async function generateInvoice(s) {
     showToast('PDF engine still loading — please try again in a moment.', 'error');
     return;
   }
-  try { await document.fonts.load('700 40px Caveat'); await document.fonts.load('600 24px Caveat'); } catch (e) {}
+
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true });
+  const fonts = await loadInvoiceFonts(doc).catch(() => ({ normal: false, bold: false, italic: false, sig: false }));
 
   let qrImg = null;
   try {
@@ -1381,319 +1604,198 @@ async function generateInvoice(s) {
     });
   } catch (e) { qrImg = null; }
 
-  const SCALE = 4;                       // px per "mm"
+  const senderFlagCode = countryCodeFromLocation(s.origin);
+  const receiverFlagCode = countryCodeFromLocation(s.destination);
+  const senderFlag = await fetchFlagPNG(senderFlagCode, 10);
+  const receiverFlag = await fetchFlagPNG(receiverFlagCode, 10);
+
   const PW = 210, PH = 297, M = 16, CW = PW - M * 2;
-  const px = mm => mm * SCALE;
-  const FS  = pt => pt * 0.3528 * SCALE;  // pt -> px
-  const FONT = 'Helvetica, Arial, sans-serif';
-  const SIGFONT = "'Caveat', cursive";
+  const BROWN = [61, 31, 10], GOLD = [233, 165, 14], INK = [50, 30, 20];
 
-  function newPage() {
-    const c = document.createElement('canvas');
-    c.width = px(PW); c.height = px(PH);
-    const ctx = c.getContext('2d');
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, c.width, c.height);
-    // faint diagonal brand watermark
-    ctx.save();
-    ctx.globalAlpha = 0.035;
-    ctx.fillStyle = 'rgb(233,165,14)';
-    ctx.font = `bold ${FS(42)}px ${FONT}`;
-    ctx.textAlign = 'center';
-    ctx.translate(px(PW / 2), px(PH / 2));
-    ctx.rotate(-28 * Math.PI / 180);
-    ctx.fillText('APEX EXPRESS LOGISTICS', 0, 0);
-    ctx.restore();
-    // outer frame
-    ctx.strokeStyle = 'rgb(240,224,210)';
-    ctx.lineWidth = px(0.35);
-    ctx.strokeRect(px(8), px(8), px(PW - 16), px(PH - 16));
-    return { c, ctx };
+  // Pre-render 300 DPI raster assets (logo + stamps + QR) once, reused across pages.
+  const logoPng = renderLogoBadgePNG(17);
+  const qrPng = qrImg ? renderQrPNG(qrImg, 20) : null;
+  const stampLegal = renderStampPNG(15, 'LEGAL GOODS', 'CUSTOMS CLEARED', 'AEL-LG-' + s.id.slice(-5), 'rgb(24,140,92)', -10);
+  const stampApproval = renderStampPNG(15, 'SHIPPING APPROVAL', 'APEX EXPRESS', 'AEL-SA-' + s.id.slice(-5), 'rgb(170,90,20)', 7);
+  const stampSecurity = renderStampPNG(15, 'SECURITY CHECKED', 'VERIFIED', 'AEL-SC-' + s.id.slice(-5), 'rgb(178,58,58)', -6);
+  const stampApproved = renderStampPNG(18, 'APPROVED', 'TERMS ACCEPTED', 'AEL-TC-' + s.id.slice(-5), 'rgb(24,140,92)', -12);
+  const stampFinal = renderStampPNG(16, 'SECURITY CHECKED', 'FINAL VERIFICATION', 'AEL-FV-' + s.id.slice(-5), 'rgb(178,58,58)', 9);
+
+  function placeStamp(stamp, cx, cy) {
+    const s2 = stamp.sizeMM;
+    doc.addImage(stamp.dataUrl, 'PNG', cx - s2 / 2, cy - s2 / 2, s2, s2, undefined, 'NONE');
   }
 
-  function drawHeader(ctx, pageLabel) {
-    ctx.fillStyle = 'rgb(61,31,10)';
-    ctx.fillRect(0, 0, px(PW), px(34));
-    ctx.fillStyle = 'rgb(233,165,14)';
-    ctx.fillRect(0, px(34), px(PW), px(2.2));
-
-    fillRR(ctx, px(M), px(8), px(17), px(17), px(3), 'rgb(233,165,14)');
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'center';
-    ctx.font = `bold ${FS(10.2)}px ${FONT}`;
-    ctx.fillText('AEL', px(M + 8.5), px(19.5));
-
-    ctx.textAlign = 'left';
-    ctx.fillStyle = '#ffffff';
-    ctx.font = `bold ${FS(15)}px ${FONT}`;
-    ctx.fillText('APEX EXPRESS LOGISTICS', px(M + 22), px(14.3));
-    ctx.font = `${FS(7.2)}px ${FONT}`;
-    ctx.fillStyle = 'rgb(240,210,180)';
-    ctx.fillText('✈  ALWAYS AT YOUR SERVICE  ✈', px(M + 22), px(19));
-    ctx.fillText('Unit 12 Heron Avenue, Wickford, Essex, SS11 8DL', px(M + 22), px(23.7));
-    ctx.fillText('info.apexexpresslogistic@gmail.com  ·  +1 160', px(M + 22), px(28.4));
-
-    ctx.textAlign = 'right';
-    ctx.fillStyle = '#ffffff';
-    ctx.font = `bold ${FS(11.5)}px ${FONT}`;
-    ctx.fillText(pageLabel, px(PW - M - 24), px(14.3));
-    ctx.font = `${FS(6.8)}px ${FONT}`;
-    ctx.fillStyle = 'rgb(240,210,180)';
-    ctx.fillText('Tracking ID: ' + s.id, px(PW - M - 24), px(19));
-    ctx.fillText('Issued: ' + new Date().toLocaleDateString(undefined, { month:'short', day:'numeric', year:'numeric' }), px(PW - M - 24), px(23.7));
-
-    /* QR code — printed in the top-right corner of every page */
-    const qrSize = 20, qrX = PW - M - qrSize, qrY = 6;
-    fillRR(ctx, px(qrX), px(qrY), px(qrSize), px(qrSize), px(1.5), '#ffffff');
-    if (qrImg) {
-      try { ctx.drawImage(qrImg, px(qrX + 1.3), px(qrY + 1.3), px(qrSize - 2.6), px(qrSize - 2.6)); } catch (e) {}
-    }
-    ctx.textAlign = 'center';
-    ctx.fillStyle = 'rgb(245,222,200)';
-    ctx.font = `${FS(5.2)}px ${FONT}`;
-    ctx.fillText('SCAN TO TRACK', px(qrX + qrSize / 2), px(qrY + qrSize + 4));
-  }
-
-  function drawFooter(ctx, pageNum) {
-    ctx.strokeStyle = 'rgb(240,224,210)';
-    ctx.lineWidth = px(0.3);
-    ctx.beginPath();
-    ctx.moveTo(px(M), px(PH - 16));
-    ctx.lineTo(px(PW - M), px(PH - 16));
-    ctx.stroke();
-    ctx.textAlign = 'center';
-    ctx.fillStyle = 'rgb(155,135,120)';
-    ctx.font = `${FS(7)}px ${FONT}`;
-    ctx.fillText('Track online: ' + buildTrackLink(s.id), px(PW / 2), px(PH - 11));
-    ctx.fillText('This is an official shipping document issued by APEX EXPRESS LOGISTICS  ·  Page ' + pageNum + ' of 3', px(PW / 2), px(PH - 6.5));
-  }
-
-  function drawSectionTitle(ctx, y, text) {
-    fillRR(ctx, px(M), px(y), px(CW), px(8.6), px(1.5), 'rgb(61,31,10)');
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'left';
-    ctx.font = `bold ${FS(9.4)}px ${FONT}`;
-    ctx.fillText(text, px(M + 3.5), px(y + 6.1));
-  }
-
-  function drawStar(ctx, cx, cy, r, color) {
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.beginPath();
-    for (let i = 0; i < 10; i++) {
-      const ang = (Math.PI / 5) * i - Math.PI / 2;
-      const rad = i % 2 === 0 ? r : r * 0.42;
-      const x = Math.cos(ang) * rad, y2 = Math.sin(ang) * rad;
-      if (i === 0) ctx.moveTo(x, y2); else ctx.lineTo(x, y2);
-    }
-    ctx.closePath();
-    ctx.fillStyle = color;
-    ctx.fill();
-    ctx.restore();
-  }
-
-  function drawCircleStamp(ctx, cx, cy, r, mainText, subText, serial, color, angle) {
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.rotate((angle || 0) * Math.PI / 180);
-    ctx.globalAlpha = 0.82;
-    ctx.strokeStyle = color;
-    ctx.fillStyle = color;
-    ctx.lineWidth = r * 0.05;
-    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke();
-    ctx.lineWidth = r * 0.026;
-    ctx.beginPath(); ctx.arc(0, 0, r * 0.83, 0, Math.PI * 2); ctx.stroke();
-    drawStar(ctx, 0, -r * 0.46, r * 0.13, color);
-    ctx.textAlign = 'center';
-    ctx.font = `bold ${r * 0.165}px ${FONT}`;
-    const words = mainText.split(' ');
-    if (words.length > 1 && mainText.length > 10) {
-      const mid = Math.ceil(words.length / 2);
-      ctx.fillText(words.slice(0, mid).join(' '), 0, -r * 0.02);
-      ctx.fillText(words.slice(mid).join(' '), 0, r * 0.17);
-    } else {
-      ctx.fillText(mainText, 0, r * 0.06);
-    }
-    ctx.font = `${r * 0.1}px ${FONT}`;
-    ctx.fillText(subText, 0, r * 0.42);
-    ctx.globalAlpha = 0.6;
-    ctx.font = `${r * 0.085}px ${FONT}`;
-    ctx.fillText(serial, 0, r * 0.6);
-    ctx.restore();
-  }
-
-  function drawSignature(ctx, x, y, w, role, name) {
-    ctx.textAlign = 'left';
-    ctx.fillStyle = 'rgb(61,31,10)';
-    ctx.font = `bold ${FS(7.6)}px ${FONT}`;
-    ctx.fillText(role.toUpperCase(), px(x), px(y));
-    ctx.fillStyle = 'rgb(60,40,30)';
-    ctx.font = `${FS(17.5)}px ${SIGFONT}`;
-    ctx.textAlign = 'center';
-    ctx.fillText(name, px(x + w / 2), px(y + 13));
-    ctx.strokeStyle = 'rgb(155,135,120)';
-    ctx.lineWidth = px(0.28);
-    ctx.beginPath();
-    ctx.moveTo(px(x), px(y + 16.5));
-    ctx.lineTo(px(x + w), px(y + 16.5));
-    ctx.stroke();
-    ctx.textAlign = 'center';
-    ctx.fillStyle = 'rgb(155,135,120)';
-    ctx.font = `${FS(6.6)}px ${FONT}`;
-    ctx.fillText('Authorized Signature', px(x + w / 2), px(y + 21.5));
-  }
-
-  function wrapText(ctx, text, maxWidth) {
-    const words = text.split(' ');
-    const lines = [];
-    let line = '';
-    words.forEach(w => {
-      const test = line ? line + ' ' + w : w;
-      if (ctx.measureText(test).width > maxWidth && line) {
-        lines.push(line);
-        line = w;
-      } else {
-        line = test;
-      }
+  function newPage(pageLabel) {
+    doc.setFillColor(255, 255, 255);
+    doc.rect(0, 0, PW, PH, 'F');
+    // big stylish, very faint "APEX" watermark, centered on the page
+    withOpacity(doc, 0.045, () => {
+      const wmText = 'APEX';
+      const wmSize = fitFontSize(doc, fonts, wmText, 'bolditalic', CW + 20, 260, 120);
+      vText(doc, fonts, wmText, PW / 2, PH / 2 + wmSize * 0.11, { weight: 'bolditalic', size: wmSize, align: 'center', color: GOLD });
     });
-    if (line) lines.push(line);
-    return lines;
+    // outer frame
+    doc.setDrawColor(240, 224, 210);
+    doc.setLineWidth(0.35);
+    doc.rect(8, 8, PW - 16, PH - 16, 'S');
+    drawHeader(pageLabel);
   }
 
-  function parseMoney(str) {
+  function drawHeader(pageLabel) {
+    vRect(doc, 0, 0, PW, 34, BROWN);
+    vRect(doc, 0, 34, PW, 2.2, GOLD);
+
+    doc.addImage(logoPng, 'PNG', M, 8, 17, 17, undefined, 'NONE');
+
+    vText(doc, fonts, 'APEX EXPRESS LOGISTICS', M + 22, 14.3, { weight: 'bold', size: 15, color: [255, 255, 255] });
+    vText(doc, fonts, '\u2708  ALWAYS AT YOUR SERVICE  \u2708', M + 22, 19, { size: 7.2, color: [240, 210, 180] });
+    vText(doc, fonts, 'Unit 12 Heron Avenue, Wickford, Essex, SS11 8DL', M + 22, 23.7, { size: 7.2, color: [240, 210, 180] });
+    vText(doc, fonts, 'info.apexexpresslogistic@gmail.com  \u00b7  +1 160', M + 22, 28.4, { size: 7.2, color: [240, 210, 180] });
+
+    vText(doc, fonts, pageLabel, PW - M - 24, 14.3, { weight: 'bold', size: 11.5, align: 'right', color: [255, 255, 255] });
+    vText(doc, fonts, 'Tracking ID: ' + s.id, PW - M - 24, 19, { size: 6.8, align: 'right', color: [240, 210, 180] });
+    vText(doc, fonts, 'Issued: ' + new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }), PW - M - 24, 23.7, { size: 6.8, align: 'right', color: [240, 210, 180] });
+
+    const qrSize = 20, qrX = PW - M - qrSize, qrY = 6;
+    vRR(doc, qrX, qrY, qrSize, qrSize, 1.5, [255, 255, 255]);
+    if (qrPng) doc.addImage(qrPng, 'PNG', qrX + 1.3, qrY + 1.3, qrSize - 2.6, qrSize - 2.6, undefined, 'NONE');
+    vText(doc, fonts, 'SCAN TO TRACK', qrX + qrSize / 2, qrY + qrSize + 4, { size: 5.2, align: 'center', color: [245, 222, 200] });
+  }
+
+  function drawFooter(pageNum) {
+    vLine(doc, M, PH - 16, PW - M, PH - 16, [240, 224, 210], 0.3);
+    vText(doc, fonts, 'Track online: ' + buildTrackLink(s.id), PW / 2, PH - 11, { size: 7, align: 'center', color: [155, 135, 120] });
+    vText(doc, fonts, 'This is an official shipping document issued by APEX EXPRESS LOGISTICS  \u00b7  Page ' + pageNum + ' of 3', PW / 2, PH - 6.5, { size: 7, align: 'center', color: [155, 135, 120] });
+  }
+
+  function drawSectionTitle(y, text) {
+    vRR(doc, M, y, CW, 8.6, 1.5, BROWN);
+    vText(doc, fonts, text, M + 3.5, y + 6.1, { weight: 'bold', size: 9.4, color: [255, 255, 255] });
+  }
+
+  function drawSignature(x, y, w, role, name) {
+    vText(doc, fonts, role.toUpperCase(), x, y, { weight: 'bold', size: 7.6, color: BROWN });
+    setSigFont(doc, fonts, 17.5);
+    doc.setTextColor(60, 40, 30);
+    doc.text(name, x + w / 2, y + 13, { align: 'center' });
+    vLine(doc, x, y + 16.5, x + w, y + 16.5, [155, 135, 120], 0.28);
+    vText(doc, fonts, 'Authorized Signature', x + w / 2, y + 21.5, { size: 6.6, align: 'center', color: [155, 135, 120] });
+  }
+
+  function fmtMoneyLocal(n) { return '\u00a3' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+  function parseMoneyLocal(str) {
     if (str == null) return null;
     const n = parseFloat(String(str).replace(/[^0-9.\-]/g, ''));
     return isNaN(n) ? null : n;
   }
-  function fmtMoney(n) {
-    return '£' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  }
 
-  /* ══════════════════════════ PAGE 1 — INVOICE ══════════════════════════ */
-  const p1 = newPage();
-  drawHeader(p1.ctx, 'SHIPPING INVOICE');
+  /* ══════════════════════ PAGE 1 — INVOICE ══════════════════════ */
+  newPage('SHIPPING INVOICE');
   let y = 44;
 
-  fillRR(p1.ctx, px(M), px(y), px(CW), px(9), px(2), 'rgb(233,165,14)');
-  p1.ctx.fillStyle = '#ffffff'; p1.ctx.textAlign = 'center';
-  p1.ctx.font = `bold ${FS(11.5)}px ${FONT}`;
-  p1.ctx.fillText('TRACKING ID: ' + s.id, px(PW / 2), px(y + 6.2));
+  vRR(doc, M, y, CW, 9, 2, GOLD);
+  vText(doc, fonts, 'TRACKING ID: ' + s.id, PW / 2, y + 6.2, { weight: 'bold', size: 11.5, align: 'center', color: [255, 255, 255] });
   y += 15;
 
   const col1x = M, col2x = PW / 2 + 2, colW = (CW / 2) - 2;
-  fillRR(p1.ctx, px(col1x), px(y), px(colW), px(38), px(2), 'rgb(255,251,247)');
-  strokeRR(p1.ctx, px(col1x), px(y), px(colW), px(38), px(2), 'rgb(114,63,26)', px(0.35));
-  p1.ctx.textAlign = 'left'; p1.ctx.fillStyle = 'rgb(61,31,10)';
-  p1.ctx.font = `bold ${FS(8.8)}px ${FONT}`;
-  p1.ctx.fillText('SENDER DETAILS', px(col1x + 4), px(y + 6.5));
-  p1.ctx.font = `${FS(8.6)}px ${FONT}`; p1.ctx.fillStyle = 'rgb(80,55,40)';
+  vRR(doc, col1x, y, colW, 38, 2, [255, 251, 247]);
+  vStrokeRR(doc, col1x, y, colW, 38, 2, [114, 63, 26], 0.35);
+  vText(doc, fonts, 'SENDER DETAILS', col1x + 4, y + 6.5, { weight: 'bold', size: 8.8, color: BROWN });
+  if (senderFlag) {
+    const fw = 10, fh = senderFlag.heightMM;
+    doc.setDrawColor(200, 185, 170); doc.setLineWidth(0.2);
+    doc.rect(col1x + colW - fw - 4, y + 3, fw, fh, 'S');
+    doc.addImage(senderFlag.dataUrl, 'PNG', col1x + colW - fw - 4, y + 3, fw, fh, undefined, 'NONE');
+  }
   [['Name', s.senderName], ['Phone', s.senderPhone], ['Email', s.senderEmail], ['Origin', s.origin]].forEach((r, i) => {
-    p1.ctx.fillText(r[0] + ':  ' + r[1], px(col1x + 4), px(y + 13.5 + i * 6.6));
+    vText(doc, fonts, r[0] + ':  ' + r[1], col1x + 4, y + 13.5 + i * 6.6, { size: 8.6, color: [80, 55, 40] });
   });
 
-  fillRR(p1.ctx, px(col2x), px(y), px(colW), px(38), px(2), 'rgb(255,249,240)');
-  strokeRR(p1.ctx, px(col2x), px(y), px(colW), px(38), px(2), 'rgb(233,165,14)', px(0.35));
-  p1.ctx.fillStyle = 'rgb(61,31,10)';
-  p1.ctx.font = `bold ${FS(8.8)}px ${FONT}`;
-  p1.ctx.fillText('RECEIVER DETAILS', px(col2x + 4), px(y + 6.5));
-  p1.ctx.font = `${FS(8.6)}px ${FONT}`; p1.ctx.fillStyle = 'rgb(80,55,40)';
+  vRR(doc, col2x, y, colW, 38, 2, [255, 249, 240]);
+  vStrokeRR(doc, col2x, y, colW, 38, 2, GOLD, 0.35);
+  vText(doc, fonts, 'RECEIVER DETAILS', col2x + 4, y + 6.5, { weight: 'bold', size: 8.8, color: BROWN });
+  if (receiverFlag) {
+    const fw = 10, fh = receiverFlag.heightMM;
+    doc.setDrawColor(200, 185, 170); doc.setLineWidth(0.2);
+    doc.rect(col2x + colW - fw - 4, y + 3, fw, fh, 'S');
+    doc.addImage(receiverFlag.dataUrl, 'PNG', col2x + colW - fw - 4, y + 3, fw, fh, undefined, 'NONE');
+  }
   [['Name', s.receiverName], ['Phone', s.receiverPhone], ['Email', s.receiverEmail], ['Destination', s.destination]].forEach((r, i) => {
-    p1.ctx.fillText(r[0] + ':  ' + r[1], px(col2x + 4), px(y + 13.5 + i * 6.6));
+    vText(doc, fonts, r[0] + ':  ' + r[1], col2x + 4, y + 13.5 + i * 6.6, { size: 8.6, color: [80, 55, 40] });
   });
 
   y += 46;
-  drawSectionTitle(p1.ctx, y, 'SHIPMENT DETAILS');
+  drawSectionTitle(y, 'SHIPMENT DETAILS');
   y += 11;
-  fillRR(p1.ctx, px(M), px(y), px(CW), px(8), px(1.5), 'rgb(247,224,186)');
-  p1.ctx.fillStyle = 'rgb(61,31,10)'; p1.ctx.font = `bold ${FS(8)}px ${FONT}`;
-  p1.ctx.textAlign = 'left';
-  p1.ctx.fillText('DESCRIPTION', px(M + 3), px(y + 5.4));
-  p1.ctx.fillText('WEIGHT', px(M + CW * 0.48), px(y + 5.4));
-  p1.ctx.fillText('QTY', px(M + CW * 0.65), px(y + 5.4));
-  p1.ctx.fillText('DECLARED VALUE', px(M + CW * 0.78), px(y + 5.4));
+  vRR(doc, M, y, CW, 8, 1.5, [247, 224, 186]);
+  vText(doc, fonts, 'DESCRIPTION', M + 3, y + 5.4, { weight: 'bold', size: 8, color: BROWN });
+  vText(doc, fonts, 'WEIGHT', M + CW * 0.48, y + 5.4, { weight: 'bold', size: 8, color: BROWN });
+  vText(doc, fonts, 'QTY', M + CW * 0.65, y + 5.4, { weight: 'bold', size: 8, color: BROWN });
+  vText(doc, fonts, 'DECLARED VALUE', M + CW * 0.78, y + 5.4, { weight: 'bold', size: 8, color: BROWN });
   y += 9;
-  p1.ctx.fillStyle = '#ffffff';
-  p1.ctx.fillRect(px(M), px(y), px(CW), px(9));
-  p1.ctx.strokeStyle = 'rgb(242,232,224)'; p1.ctx.lineWidth = px(0.25);
-  p1.ctx.strokeRect(px(M), px(y), px(CW), px(9));
-  p1.ctx.fillStyle = 'rgb(50,30,20)'; p1.ctx.font = `${FS(8.6)}px ${FONT}`;
-  p1.ctx.fillText(s.goods, px(M + 3), px(y + 6.1));
-  p1.ctx.fillText(String(s.weight), px(M + CW * 0.48), px(y + 6.1));
-  p1.ctx.fillText(String(s.quantity || '1'), px(M + CW * 0.65), px(y + 6.1));
-  p1.ctx.fillText(String(s.declaredValue || 'N/A'), px(M + CW * 0.78), px(y + 6.1));
+  vRect(doc, M, y, CW, 9, [255, 255, 255]);
+  doc.setDrawColor(242, 232, 224); doc.setLineWidth(0.25); doc.rect(M, y, CW, 9, 'S');
+  vText(doc, fonts, s.goods, M + 3, y + 6.1, { size: 8.6, color: INK });
+  vText(doc, fonts, String(s.weight), M + CW * 0.48, y + 6.1, { size: 8.6, color: INK });
+  vText(doc, fonts, String(s.quantity || '1'), M + CW * 0.65, y + 6.1, { size: 8.6, color: INK });
+  vText(doc, fonts, String(s.declaredValue || 'N/A'), M + CW * 0.78, y + 6.1, { size: 8.6, color: INK });
   y += 9 + 6;
 
-  drawSectionTitle(p1.ctx, y, 'TRACKING INFORMATION');
+  drawSectionTitle(y, 'TRACKING INFORMATION');
   y += 11;
-  p1.ctx.fillStyle = 'rgb(70,45,30)'; p1.ctx.font = `${FS(8.6)}px ${FONT}`;
-  p1.ctx.fillText('Service Type:  ' + (s.service || '—'), px(M + 2), px(y));
-  p1.ctx.fillText('Date Shipped:  ' + fmtDateOnly(s.dateShipped), px(M + 2), px(y + 7.8));
-  p1.ctx.fillText('Expected Delivery:  ' + fmtDateOnly(s.eta), px(M + 2), px(y + 15.6));
-  p1.ctx.fillText('Current Stage:  ' + s.status, px(M + 2), px(y + 23.4));
+  vText(doc, fonts, 'Service Type:  ' + (s.service || '\u2014'), M + 2, y, { size: 8.6, color: [70, 45, 30] });
+  vText(doc, fonts, 'Date Shipped:  ' + fmtDateOnly(s.dateShipped), M + 2, y + 7.8, { size: 8.6, color: [70, 45, 30] });
+  vText(doc, fonts, 'Expected Delivery:  ' + fmtDateOnly(s.eta), M + 2, y + 15.6, { size: 8.6, color: [70, 45, 30] });
+  vText(doc, fonts, 'Current Stage:  ' + s.status, M + 2, y + 23.4, { size: 8.6, color: [70, 45, 30] });
 
   const bx = M + CW * 0.55, bw = CW * 0.45;
-  fillRR(p1.ctx, px(bx), px(y - 4), px(bw), px(22), px(1.5), 'rgb(253,250,247)');
-  strokeRR(p1.ctx, px(bx), px(y - 4), px(bw), px(22), px(1.5), 'rgb(238,222,210)', px(0.3));
-  p1.ctx.strokeStyle = 'rgb(40,25,15)';
+  vRR(doc, bx, y - 4, bw, 22, 1.5, [253, 250, 247]);
+  vStrokeRR(doc, bx, y - 4, bw, 22, 1.5, [238, 222, 210], 0.3);
+  doc.setDrawColor(40, 25, 15);
   for (let i = 0; i < 28; i++) {
     const bw2 = (Math.sin(i * 17) + 1.4);
-    p1.ctx.lineWidth = px(0.35 * bw2);
+    doc.setLineWidth(0.35 * bw2);
     const bxi = bx + 3 + i * (bw - 6) / 28;
-    p1.ctx.beginPath();
-    p1.ctx.moveTo(px(bxi), px(y - 1));
-    p1.ctx.lineTo(px(bxi), px(y + 14));
-    p1.ctx.stroke();
+    doc.line(bxi, y - 1, bxi, y + 14);
   }
-  p1.ctx.textAlign = 'center'; p1.ctx.fillStyle = 'rgb(120,100,90)'; p1.ctx.font = `${FS(6.2)}px ${FONT}`;
-  p1.ctx.fillText(s.id, px(bx + bw / 2), px(y + 19));
+  vText(doc, fonts, s.id, bx + bw / 2, y + 19, { size: 6.2, align: 'center', color: [120, 100, 90] });
 
   y += 33;
 
   const isDelivered = s.status === 'Delivered';
-  const isTransit   = !isDelivered && s.status !== 'Shipment Created';
-  const bannerColor = isDelivered ? 'rgb(26,163,122)' : isTransit ? 'rgb(61,31,10)' : 'rgb(128,96,74)';
-  fillRR(p1.ctx, px(M), px(y), px(CW), px(11), px(2), bannerColor);
-  p1.ctx.fillStyle = '#ffffff'; p1.ctx.textAlign = 'center'; p1.ctx.font = `bold ${FS(9.8)}px ${FONT}`;
-  p1.ctx.fillText('CURRENT STAGE: ' + s.status.toUpperCase(), px(PW / 2), px(y + 7.4));
+  const isTransit = !isDelivered && s.status !== 'Shipment Created';
+  const bannerColor = isDelivered ? [26, 163, 122] : isTransit ? BROWN : [128, 96, 74];
+  vRR(doc, M, y, CW, 11, 2, bannerColor);
+  vText(doc, fonts, 'CURRENT STAGE: ' + s.status.toUpperCase(), PW / 2, y + 7.4, { weight: 'bold', size: 9.8, align: 'center', color: [255, 255, 255] });
 
   if (isDelivered) {
-    p1.ctx.save();
-    p1.ctx.globalAlpha = 0.08;
-    p1.ctx.fillStyle = 'rgb(26,163,122)';
-    p1.ctx.font = `bold ${FS(50)}px ${FONT}`;
-    p1.ctx.textAlign = 'center';
-    p1.ctx.translate(px(PW / 2), px(150));
-    p1.ctx.rotate(-30 * Math.PI / 180);
-    p1.ctx.fillText('DELIVERED', 0, 0);
-    p1.ctx.restore();
+    withOpacity(doc, 0.1, () => {
+      vText(doc, fonts, 'DELIVERED', PW / 2, 150, { weight: 'bold', size: 50, align: 'center', angle: 30, color: [26, 163, 122] });
+    });
   }
   y += 20;
 
   const sigW = (CW - 16) / 3;
-  drawSignature(p1.ctx, M, y, sigW, 'Manager', 'J. Franklin');
-  drawSignature(p1.ctx, M + sigW + 8, y, sigW, 'Sender', s.senderName);
-  drawSignature(p1.ctx, M + (sigW + 8) * 2, y, sigW, 'Security', 'M. Ortega');
+  drawSignature(M, y, sigW, 'Manager', 'J. Franklin');
+  drawSignature(M + sigW + 8, y, sigW, 'Sender', s.senderName);
+  drawSignature(M + (sigW + 8) * 2, y, sigW, 'Security', 'M. Ortega');
   y += 34;
 
   const stampY = y + 13;
-  drawCircleStamp(p1.ctx, px(M + 22), px(stampY), px(15), 'LEGAL GOODS', 'CUSTOMS CLEARED', 'AEL-LG-' + s.id.slice(-5), 'rgb(24,140,92)', -10);
-  drawCircleStamp(p1.ctx, px(PW / 2), px(stampY), px(15), 'SHIPPING APPROVAL', 'APEX EXPRESS', 'AEL-SA-' + s.id.slice(-5), 'rgb(170,90,20)', 7);
-  drawCircleStamp(p1.ctx, px(PW - M - 22), px(stampY), px(15), 'SECURITY CHECKED', 'VERIFIED', 'AEL-SC-' + s.id.slice(-5), 'rgb(178,58,58)', -6);
+  placeStamp(stampLegal, M + 22, stampY);
+  placeStamp(stampApproval, PW / 2, stampY);
+  placeStamp(stampSecurity, PW - M - 22, stampY);
 
-  drawFooter(p1.ctx, 1);
+  drawFooter(1);
 
-  /* ══════════════════════════ PAGE 2 — TERMS ══════════════════════════ */
-  const p2 = newPage();
-  drawHeader(p2.ctx, 'TERMS & CONDITIONS');
+  /* ══════════════════════ PAGE 2 — TERMS ══════════════════════ */
+  doc.addPage();
+  newPage('TERMS & CONDITIONS');
   y = 46;
-  p2.ctx.textAlign = 'left';
-  p2.ctx.fillStyle = 'rgb(61,31,10)';
-  p2.ctx.font = `bold ${FS(14.5)}px ${FONT}`;
-  p2.ctx.fillText('TERMS & CONDITIONS OF CARRIAGE', px(M), px(y));
+  vText(doc, fonts, 'TERMS & CONDITIONS OF CARRIAGE', M, y, { weight: 'bold', size: 14.5, color: BROWN });
   y += 5;
-  p2.ctx.strokeStyle = 'rgb(233,165,14)'; p2.ctx.lineWidth = px(0.6);
-  p2.ctx.beginPath(); p2.ctx.moveTo(px(M), px(y)); p2.ctx.lineTo(px(M + 50), px(y)); p2.ctx.stroke();
+  vLine(doc, M, y, M + 50, y, GOLD, 0.6);
   y += 13;
 
   const terms = [
@@ -1707,31 +1809,26 @@ async function generateInvoice(s) {
     ['8. Governing Law', 'This agreement is governed by the shipping regulations applicable at the port of origin, without regard to conflict-of-law principles.'],
   ];
   terms.forEach(([head, body]) => {
-    p2.ctx.fillStyle = 'rgb(61,31,10)';
-    p2.ctx.font = `bold ${FS(9.2)}px ${FONT}`;
-    p2.ctx.fillText(head, px(M), px(y));
+    vText(doc, fonts, head, M, y, { weight: 'bold', size: 9.2, color: BROWN });
     y += 6.6;
-    p2.ctx.fillStyle = 'rgb(85,65,55)';
-    p2.ctx.font = `${FS(8.2)}px ${FONT}`;
-    const lines = wrapText(p2.ctx, body, px(CW));
-    lines.forEach(line => { p2.ctx.fillText(line, px(M), px(y)); y += 6; });
+    setInvoiceFont(doc, fonts, 'normal', 8.2);
+    const lines = doc.splitTextToSize(body, CW);
+    lines.forEach(line => { vText(doc, fonts, line, M, y, { size: 8.2, color: [85, 65, 55] }); y += 6; });
     y += 4;
   });
 
   y += 8;
-  p2.ctx.fillStyle = 'rgb(60,40,30)';
-  p2.ctx.font = `italic ${FS(8)}px ${FONT}`;
-  p2.ctx.fillText('By accepting this shipment, the sender and receiver acknowledge and agree to the terms above.', px(M), px(y));
+  vText(doc, fonts, 'By accepting this shipment, the sender and receiver acknowledge and agree to the terms above.', M, y, { weight: 'italic', size: 8, color: [60, 40, 30] });
 
-  drawCircleStamp(p2.ctx, px(PW - M - 26), px(PH - 46), px(18), 'APPROVED', 'TERMS ACCEPTED', 'AEL-TC-' + s.id.slice(-5), 'rgb(24,140,92)', -12);
+  placeStamp(stampApproved, PW - M - 26, PH - 46);
 
-  drawFooter(p2.ctx, 2);
+  drawFooter(2);
 
-  /* ══════════════════════════ PAGE 3 — TIMELINE & PAYMENT ══════════════════════════ */
-  const p3 = newPage();
-  drawHeader(p3.ctx, 'TIMELINE & PAYMENT');
+  /* ══════════════════════ PAGE 3 — TIMELINE & PAYMENT ══════════════════════ */
+  doc.addPage();
+  newPage('TIMELINE & PAYMENT');
   y = 46;
-  drawSectionTitle(p3.ctx, y, 'SHIPPING TIMELINE');
+  drawSectionTitle(y, 'SHIPPING TIMELINE');
   y += 11;
 
   const curIdx = STAGES.indexOf(s.status);
@@ -1741,63 +1838,45 @@ async function generateInvoice(s) {
 
   STAGES.forEach((stage, i) => {
     const done = curIdx >= 0 && i <= curIdx;
-    p3.ctx.fillStyle = i % 2 === 0 ? 'rgb(255,251,247)' : 'rgb(255,255,255)';
-    p3.ctx.fillRect(px(M), px(y), px(CW), px(9.6));
-    p3.ctx.fillStyle = done ? 'rgb(233,165,14)' : 'rgb(200,185,175)';
-    p3.ctx.font = `${done ? 'bold ' : ''}${FS(9)}px ${FONT}`;
-    p3.ctx.textAlign = 'left';
-    p3.ctx.fillText((done ? '✓  ' : '○  ') + stage, px(M + 3), px(y + 6.6));
+    vRect(doc, M, y, CW, 9.6, i % 2 === 0 ? [255, 251, 247] : [255, 255, 255]);
+    vText(doc, fonts, (done ? '\u2713  ' : '\u25cb  ') + stage, M + 3, y + 6.6, { weight: done ? 'bold' : 'normal', size: 9, color: done ? GOLD : [200, 185, 175] });
     const t = stageTimes[stage];
-    p3.ctx.textAlign = 'right';
-    p3.ctx.fillStyle = 'rgb(150,130,120)'; p3.ctx.font = `${FS(7.4)}px ${FONT}`;
-    p3.ctx.fillText(t ? fmtDate(t) : (done ? '—' : 'Pending'), px(PW - M - 3), px(y + 6.4));
+    vText(doc, fonts, t ? fmtDate(t) : (done ? '\u2014' : 'Pending'), PW - M - 3, y + 6.4, { size: 7.4, align: 'right', color: [150, 130, 120] });
     y += 9.6;
   });
   y += 10;
 
-  drawSectionTitle(p3.ctx, y, 'PAYMENT SUMMARY');
+  drawSectionTitle(y, 'PAYMENT SUMMARY');
   y += 11;
-  const declared = parseMoney(s.declaredValue);
-  const total = parseMoney(s.amountToPay);
+  const declared = parseMoneyLocal(s.declaredValue);
+  const total = parseMoneyLocal(s.amountToPay);
   let shipFee = null;
   if (declared != null && total != null && total >= declared) shipFee = total - declared;
 
   const rows = [
-    ['Subtotal (Declared Value)', declared != null ? fmtMoney(declared) : (s.declaredValue || 'N/A')],
-    ['Shipping & Handling Fee', shipFee != null ? fmtMoney(shipFee) : '—'],
+    ['Subtotal (Declared Value)', declared != null ? fmtMoneyLocal(declared) : (s.declaredValue || 'N/A')],
+    ['Shipping & Handling Fee', shipFee != null ? fmtMoneyLocal(shipFee) : '\u2014'],
   ];
   rows.forEach((r, i) => {
-    p3.ctx.fillStyle = i % 2 === 0 ? 'rgb(255,251,247)' : 'rgb(255,255,255)';
-    p3.ctx.fillRect(px(M), px(y), px(CW), px(9.2));
-    p3.ctx.fillStyle = 'rgb(105,85,70)'; p3.ctx.font = `${FS(8.8)}px ${FONT}`; p3.ctx.textAlign = 'left';
-    p3.ctx.fillText(r[0], px(M + 3), px(y + 6.2));
-    p3.ctx.fillStyle = 'rgb(61,31,10)'; p3.ctx.font = `bold ${FS(8.8)}px ${FONT}`; p3.ctx.textAlign = 'right';
-    p3.ctx.fillText(r[1], px(PW - M - 3), px(y + 6.2));
+    vRect(doc, M, y, CW, 9.2, i % 2 === 0 ? [255, 251, 247] : [255, 255, 255]);
+    vText(doc, fonts, r[0], M + 3, y + 6.2, { size: 8.8, color: [105, 85, 70] });
+    vText(doc, fonts, r[1], PW - M - 3, y + 6.2, { weight: 'bold', size: 8.8, align: 'right', color: BROWN });
     y += 9.2;
   });
 
-  fillRR(p3.ctx, px(M), px(y + 2), px(CW), px(12.4), px(2), 'rgb(61,31,10)');
-  p3.ctx.fillStyle = '#ffffff'; p3.ctx.textAlign = 'left'; p3.ctx.font = `bold ${FS(9.6)}px ${FONT}`;
-  p3.ctx.fillText('TOTAL AMOUNT TO BE PAID', px(M + 4), px(y + 10.1));
-  p3.ctx.textAlign = 'right'; p3.ctx.font = `bold ${FS(12.6)}px ${FONT}`;
-  p3.ctx.fillText(total != null ? fmtMoney(total) : (s.amountToPay || 'N/A'), px(PW - M - 4), px(y + 10.1));
+  vRR(doc, M, y + 2, CW, 12.4, 2, BROWN);
+  vText(doc, fonts, 'TOTAL AMOUNT TO BE PAID', M + 4, y + 10.1, { weight: 'bold', size: 9.6, color: [255, 255, 255] });
+  vText(doc, fonts, total != null ? fmtMoneyLocal(total) : (s.amountToPay || 'N/A'), PW - M - 4, y + 10.1, { weight: 'bold', size: 12.6, align: 'right', color: [255, 255, 255] });
   y += 30;
 
-  drawSignature(p3.ctx, M, y, 70, 'Manager', 'J. Franklin');
-  drawCircleStamp(p3.ctx, px(PW - M - 26), px(y - 6), px(16), 'SECURITY CHECKED', 'FINAL VERIFICATION', 'AEL-FV-' + s.id.slice(-5), 'rgb(178,58,58)', 9);
+  drawSignature(M, y, 70, 'Manager', 'J. Franklin');
+  placeStamp(stampFinal, PW - M - 26, y - 6);
 
-  drawFooter(p3.ctx, 3);
+  drawFooter(3);
 
-  /* ══════════════════════════ ASSEMBLE 3-PAGE PDF ══════════════════════════ */
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
-  doc.addImage(p1.c.toDataURL('image/jpeg', 0.93), 'JPEG', 0, 0, PW, PH);
-  doc.addPage();
-  doc.addImage(p2.c.toDataURL('image/jpeg', 0.93), 'JPEG', 0, 0, PW, PH);
-  doc.addPage();
-  doc.addImage(p3.c.toDataURL('image/jpeg', 0.93), 'JPEG', 0, 0, PW, PH);
+  /* ══════════════════════ SAVE ══════════════════════ */
   doc.save('ApexExpress-Invoice-' + s.id + '.pdf');
-  showToast('3-page invoice PDF downloaded ✓', 'success');
+  showToast('3-page invoice PDF downloaded \u2713', 'success');
 }
 
 function esc(str) {
